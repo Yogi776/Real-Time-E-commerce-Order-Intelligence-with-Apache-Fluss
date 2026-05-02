@@ -1,0 +1,74 @@
+# Production Load Test Override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod-test.yml up -d --scale taskmanager=3
+#
+# This override scales the infrastructure for 5,000 events/sec:
+#   - 3 TaskManagers (30 slots total)
+#   - 2 TabletServers for write parallelism
+#   - Increased memory allocations
+#   - Tuned checkpointing for high throughput
+
+services:
+  # Scale TabletServer for write parallelism
+  tablet-server:
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server:9123
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+
+  tablet-server-2:
+    image: apache/fluss:0.9.0-incubating
+    command: tabletServer
+    depends_on:
+      coordinator-server:
+        condition: service_healthy
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server-2:9123
+        tablet-server.id: 1
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':23A3' /proc/net/tcp6"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Increased JobManager memory
+  jobmanager:
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 2048m
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 60s
+        execution.checkpointing.min-pause: 30s
+        execution.checkpointing.timeout: 120s
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 30s
+
+  # Scaled TaskManagers with more memory
+  taskmanager:
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 4096m
+        taskmanager.memory.framework.off-heap.size: 512m
+        taskmanager.memory.task.off-heap.size: 256m
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 60s
