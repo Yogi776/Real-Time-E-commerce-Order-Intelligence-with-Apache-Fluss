@@ -1,0 +1,122 @@
+-- =============================================================================
+-- 07_large_volume_simulation.sql
+-- Guidance and SQL for simulating large-volume order processing.
+-- This file is primarily documentation with executable examples.
+--
+-- DO NOT run all generators simultaneously on a local machine.
+-- Start with defaults and scale up incrementally.
+-- =============================================================================
+
+-- =============================================================================
+-- TIER 1: Default Demo (50 events/sec = ~180K orders/hour)
+-- =============================================================================
+-- This is what 04_generate_orders.sql does by default.
+-- Safe for any machine with Docker running (4GB RAM minimum).
+-- Produces enough data to see aggregation windows fill within minutes.
+
+-- =============================================================================
+-- TIER 2: Medium Load (500 events/sec = ~1.8M orders/hour)
+-- =============================================================================
+-- Requirements:
+--   - 8GB+ RAM allocated to Docker
+--   - 2+ TaskManager slots available
+--   - Monitor Flink Web UI for backpressure (localhost:8083)
+--
+-- To use: Create a new faker source with higher rate and submit.
+-- You can run this alongside the default generator for combined throughput.
+
+-- CREATE TEMPORARY TABLE fake_orders_medium (
+--     order_id          STRING,
+--     customer_id       STRING,
+--     product_id        STRING,
+--     order_amount_str  STRING,
+--     quantity          INT,
+--     payment_status    STRING,
+--     order_status      STRING,
+--     payment_method    STRING,
+--     device_type       STRING,
+--     city              STRING,
+--     event_time        TIMESTAMP(3)
+-- ) WITH (
+--     'connector' = 'faker',
+--     'rows-per-second' = '500',
+--     'fields.order_id.expression' = '#{Internet.uuid}',
+--     'fields.customer_id.expression' = '#{Options.option ''CUS-bc3f5734'',''CUS-244579ca'',''CUS-ae9a6504'',''CUS-7f150bce'',''CUS-8e8e0349'',''CUS-6ece6507'',''CUS-96aac47f'',''CUS-b3d3f099'',''CUS-27fe0d2e'',''CUS-6bf9b9ec'',''CUS-2ea26c14'',''CUS-168bc0ab'',''CUS-3fc6fc46'',''CUS-b17e412c'',''CUS-2af65034'',''CUS-4412e697'',''CUS-37aadd9e'',''CUS-1cc815bd'',''CUS-db0f99df'',''CUS-9af32bee''}',
+--     'fields.product_id.expression' = '#{Options.option ''SKU-ELEC-1001'',''SKU-ELEC-1002'',''SKU-ELEC-1003'',''SKU-ELEC-1004'',''SKU-ELEC-1005'',''SKU-ELEC-1006'',''SKU-FASH-2001'',''SKU-FASH-2002'',''SKU-FASH-2003'',''SKU-FASH-2004'',''SKU-FASH-2005'',''SKU-FASH-2006'',''SKU-GROC-3001'',''SKU-GROC-3002'',''SKU-GROC-3003'',''SKU-GROC-3004'',''SKU-GROC-3005'',''SKU-BOOK-4001'',''SKU-BOOK-4002'',''SKU-BOOK-4003'',''SKU-BOOK-4004'',''SKU-BOOK-4005'',''SKU-BEAU-5001'',''SKU-BEAU-5002'',''SKU-BEAU-5003'',''SKU-BEAU-5004'',''SKU-SPRT-6001'',''SKU-SPRT-6002'',''SKU-SPRT-6003'',''SKU-SPRT-6004''}',
+--     'fields.order_amount_str.expression' = '#{Options.option ''275'',''299'',''349'',''399'',''549'',''899'',''1175'',''1299'',''1499'',''2999'',''3499'',''4499'',''5999'',''8999'',''8999'',''24999'',''54999'',''69999'',''79999'',''114999''}',
+--     'fields.quantity.expression' = '#{number.numberBetween ''1'',''3''}',
+--     'fields.payment_status.expression' = '#{Options.option ''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''SUCCESS'',''FAILED'',''FAILED'',''PENDING''}',
+--     'fields.order_status.expression' = '#{Options.option ''PLACED'',''PLACED'',''PLACED'',''PLACED'',''PLACED'',''SHIPPED'',''SHIPPED'',''DELIVERED'',''DELIVERED'',''CANCELLED''}',
+--     'fields.payment_method.expression' = '#{Options.option ''UPI'',''UPI'',''UPI'',''UPI'',''UPI'',''UPI'',''UPI'',''UPI'',''CARD'',''CARD'',''CARD'',''CARD'',''WALLET'',''WALLET'',''WALLET'',''COD'',''COD'',''COD'',''NETBANKING'',''NETBANKING''}',
+--     'fields.device_type.expression' = '#{Options.option ''ANDROID'',''ANDROID'',''ANDROID'',''ANDROID'',''ANDROID'',''ANDROID'',''WEB'',''WEB'',''IOS'',''IOS''}',
+--     'fields.city.expression' = '#{Options.option ''Mumbai'',''Mumbai'',''Mumbai'',''Mumbai'',''Delhi'',''Delhi'',''Delhi'',''Delhi'',''Bengaluru'',''Bengaluru'',''Bengaluru'',''Pune'',''Pune'',''Hyderabad'',''Hyderabad'',''Chennai'',''Chennai'',''Ahmedabad'',''Ahmedabad'',''Kolkata''}',
+--     'fields.event_time.expression' = '#{date.past ''15'',''SECONDS''}'
+-- );
+--
+-- INSERT INTO orders_raw
+-- SELECT order_id, customer_id, product_id,
+--        CAST(order_amount_str AS DECIMAL(10, 2)),
+--        quantity, payment_status, order_status, payment_method,
+--        device_type, city, event_time
+-- FROM fake_orders_medium;
+
+-- =============================================================================
+-- TIER 3: High Load (5000 events/sec = ~18M orders/hour)
+-- =============================================================================
+-- WARNING: This WILL stress a local Docker setup. Only use for targeted testing.
+--
+-- Requirements:
+--   - 16GB+ RAM allocated to Docker
+--   - Scale TaskManagers: docker compose up --scale taskmanager=3
+--   - Increase Flink parallelism
+--   - Monitor backpressure closely
+--   - Increase checkpoint interval to 60s to reduce overhead
+--
+-- SET 'execution.checkpointing.interval' = '60s';
+--
+-- Use the same CREATE TABLE pattern above with 'rows-per-second' = '5000'
+
+-- =============================================================================
+-- SCALING TASKMANAGERS
+-- =============================================================================
+-- To add more Flink compute capacity:
+--   docker compose up --scale taskmanager=3 -d
+--
+-- Each TaskManager provides 10 task slots (configured in docker-compose.yml).
+-- 3 TaskManagers = 30 total slots for parallel processing.
+
+-- =============================================================================
+-- INCREASING CUSTOMER/PRODUCT CARDINALITY
+-- =============================================================================
+-- To simulate a larger catalog:
+--   python datagen/generate_seed_data.py --customers 500 --output sql/03_seed_data.sql
+--
+-- Then regenerate 04_generate_orders.sql with updated IDs:
+--   python datagen/generate_seed_data.py --customers 500 --emit-ids
+--
+-- Copy the output into the Options.option expressions.
+
+-- =============================================================================
+-- WHAT TO MONITOR DURING LOAD TESTS
+-- =============================================================================
+-- 1. Flink Web UI (localhost:8083):
+--    - Job status (RUNNING vs FAILING)
+--    - Backpressure indicators (should be LOW or OK)
+--    - Checkpoint duration and size
+--    - Records in/out per operator
+--
+-- 2. Docker resource usage:
+--    docker stats
+--
+-- 3. Fluss table row counts (run in batch mode):
+--    SET 'execution.runtime-mode' = 'batch';
+--    SELECT COUNT(*) FROM orders_raw;
+--    SELECT COUNT(*) FROM orders_enriched;
+
+-- =============================================================================
+-- WHAT TO AVOID ON LOCAL MACHINES
+-- =============================================================================
+-- - Do NOT run 5000+ events/sec with a single TaskManager
+-- - Do NOT run expensive SELECT * queries during high load
+-- - Do NOT skip monitoring; backpressure signals tell you when to stop
+-- - Do NOT increase generator rate without checking Docker memory first
