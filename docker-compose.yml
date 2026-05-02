@@ -1,0 +1,149 @@
+services:
+  # --- Apache ZooKeeper (coordination for Fluss) ---
+  zookeeper:
+    image: zookeeper:3.9.2
+    restart: always
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Zookeeper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Fluss CoordinatorServer ---
+  coordinator-server:
+    image: apache/fluss:0.9.0-incubating
+    command: coordinatorServer
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9123:9123"
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: /tmp/fluss/remote-data
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':23A3' /proc/net/tcp6"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # --- Fluss TabletServer (data storage) ---
+  tablet-server:
+    image: apache/fluss:0.9.0-incubating
+    command: tabletServer
+    depends_on:
+      coordinator-server:
+        condition: service_healthy
+    ports:
+      - "9124:9123"
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server:9123
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':23A3' /proc/net/tcp6"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # --- Apache Flink JobManager ---
+  jobmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    command: jobmanager
+    ports:
+      - "8084:8081"   # Flink Web UI (8083 often used by other Fluss demos)
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.min-pause: 10s
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/overview || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # --- Apache Flink TaskManager ---
+  taskmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    command: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.framework.off-heap.size: 256m
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 30s
+
+  # --- Flink SQL Gateway (REST API for dashboard queries) ---
+  sql-gateway:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    command: ["bash", "-c", "/opt/flink/bin/sql-gateway.sh start-foreground -Dsql-gateway.endpoint.rest.address=0.0.0.0 -Dsql-gateway.endpoint.rest.port=8085 -Djobmanager.rpc.address=jobmanager -Drest.address=jobmanager -Dexecution.target=remote"]
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+      tablet-server:
+        condition: service_healthy
+    ports:
+      - "8085:8085"   # SQL Gateway REST API
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # --- Flink SQL Client (interactive queries) ---
+  sql-client:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    command: /opt/sql-client/sql-client
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+      tablet-server:
+        condition: service_healthy
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    stdin_open: true
+    tty: true
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"
