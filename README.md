@@ -342,6 +342,197 @@ This repository is a **local development demo**. Production deployment requires:
     └── production-readiness-checklist.md # Deployment checklist
 ```
 
+## Solution Architecture — Deep Dive
+
+### Functional Requirements
+
+| Requirement | Implementation |
+|-------------|---------------|
+| Ingest orders in real-time | flink-faker → `orders_raw` (Log table, 50 events/sec) |
+| Enrich with dimensions | Temporal lookup joins → `orders_enriched` |
+| Compute revenue metrics | 5-min tumbling windows → `revenue_5min`, `city_revenue_5min` |
+| Detect failed payments | Streaming filter on `payment_status = 'FAILED'` |
+| Detect suspicious orders | Multi-rule CASE logic → `suspicious_orders` |
+| Query latest events | SQL Gateway REST API with LIMIT scans |
+| Pre-materialized KPIs | 1-min windows → `dashboard_kpis` (5 metrics) |
+| Support historical analytics | Phase 2: Lakehouse tiering to Iceberg/Paimon |
+
+### Non-Functional Requirements
+
+| Requirement | Target | Implementation |
+|-------------|--------|---------------|
+| Latency | < 5s ingestion-to-query | Streaming mode, no batch delays |
+| Throughput | 50-5000 events/sec | Partitioned tables, 8-16 buckets |
+| Fault tolerance | Zero data loss | Flink checkpointing + restart strategy |
+| Scalability | Horizontal | Add TaskManagers + TabletServers |
+| No operational impact | Full isolation | Event-driven, no DB queries |
+| Backpressure handling | Graceful | Flink native backpressure propagation |
+| Data freshness | < 10s for hot tables | Streaming writes, no batch commit |
+
+### Storage Design Decisions
+
+```mermaid
+flowchart TB
+    subgraph design ["Storage Layer Design"]
+        direction TB
+        LOG["Log Tables (Append-Only)"]
+        PK["PK Tables (Upsert)"]
+        PART["Partitioned Tables"]
+        FLAT["Flat Tables"]
+    end
+
+    LOG --> |"Raw immutable events"| RAW[orders_raw]
+    PK --> |"Dimensions + Facts"| DIM[customer_profile<br/>product_catalog]
+    PK --> |"Enriched + Aggregates"| FACT[orders_enriched<br/>revenue_5min]
+    PK --> |"Alerts + KPIs"| ALERT[high_value_orders<br/>suspicious_orders<br/>dashboard_kpis]
+    PART --> |"High-volume, time-bounded"| RAW
+    PART --> |"High-volume, time-bounded"| FACT
+    FLAT --> |"Small, frequently accessed"| DIM
+    FLAT --> |"Small, frequently accessed"| ALERT
+```
+
+**Why Log Table for `orders_raw`:**
+- Append-only guarantees immutability (audit trail)
+- Supports watermarks for event-time processing
+- Enables replay for reprocessing
+
+**Why PK Tables for everything else:**
+- Upsert semantics for dimension updates
+- Deduplication by primary key
+- Supports changelog consumption by downstream jobs
+
+**Why Partitioning on day:**
+- Auto-retention (7 days) prevents unbounded growth
+- Storage lifecycle management without manual intervention
+- Future-ready for partition-pruned queries (when Fluss adds datalake support)
+
+## System Design — Technical Implementation
+
+### Current vs Proposed Architecture
+
+```mermaid
+flowchart TB
+    subgraph current ["Traditional Architecture (Problems)"]
+        direction LR
+        APP1[Order Service] --> DB1[(PostgreSQL)]
+        DB1 --> |"Heavy analytics queries"| BI1[Dashboard]
+        DB1 --> |"Batch ETL"| LAKE1[(Data Lake)]
+        LAKE1 --> |"Minutes-hours delay"| BI1
+    end
+
+    subgraph proposed ["Fluss Architecture (This Project)"]
+        direction LR
+        APP2[Order Service] --> |"Lightweight events"| FLINK2[Flink SQL]
+        FLINK2 --> FLUSS2[(Fluss Tables)]
+        FLUSS2 --> |"Real-time"| BI2[Dashboard]
+        FLUSS2 --> |"Phase 2"| LAKE2[(Lakehouse)]
+    end
+
+    current -->|"Migrate to"| proposed
+```
+
+### Data Volume Assumptions
+
+| Scenario | Events/sec | Events/day | Storage/day | Flink Parallelism |
+|----------|-----------|------------|-------------|-------------------|
+| Local demo | 50 | 4.3M | ~4 GB | 1 TaskManager |
+| Pre-production | 500 | 43M | ~40 GB | 2-4 TaskManagers |
+| Production | 5,000 | 432M | ~400 GB | 8-16 TaskManagers |
+| Peak traffic | 50,000 | 4.3B | ~4 TB | 32+ TaskManagers |
+
+### Capacity Planning
+
+```
+Events/sec: 50 (demo) → 5,000 (prod)
+Event size: ~1 KB (JSON)
+Storage/hour: 180 MB (demo) → 18 GB (prod)
+Partitions/day: 1 per table
+Retention: 7 days hot (Fluss) + unlimited cold (Phase 2 lakehouse)
+Checkpoint storage: ~100 MB per job
+Total Flink slots needed: 7 (one per streaming job)
+```
+
+### Bottlenecks and Mitigations
+
+| Bottleneck | Symptom | Mitigation |
+|-----------|---------|-----------|
+| Source ingestion | Rising consumer lag | Increase generator parallelism, add partitions |
+| Flink backpressure | Slow checkpoint, high latency | Increase TaskManager parallelism, optimize joins |
+| Large enrichment joins | OOM, checkpoint timeout | Temporal lookup joins (bounded state), TTL |
+| Dashboard queries | Timeout on large tables | Pre-materialized KPIs, LIMIT scans, parallel workers |
+| Unbounded table growth | Disk full, slow scans | Auto-partition retention (7 days), lakehouse tiering |
+| Small files (lakehouse) | Slow historical queries | Compaction, controlled commit intervals |
+
+### Streaming Job Dependency Graph
+
+```mermaid
+flowchart TD
+    SEED[03_seed_data.sql<br/>Batch: Load dimensions] --> GEN
+    GEN[04_generate_orders.sql<br/>Streaming: Generate events] --> ENR
+    GEN --> AGG
+    GEN --> KPI
+    ENR[05_enrich_orders.sql<br/>Streaming: Temporal joins] --> ANO
+    AGG[06_revenue_aggregates.sql<br/>Streaming: 5-min windows]
+    ANO[08_anomaly_detection.sql<br/>Streaming: Fraud rules]
+    KPI[10_dashboard_kpis.sql<br/>Streaming: 1-min KPIs]
+
+    style SEED fill:#e8f5e9
+    style GEN fill:#fff3e0
+    style ENR fill:#e3f2fd
+    style AGG fill:#e3f2fd
+    style ANO fill:#fce4ec
+    style KPI fill:#f3e5f5
+```
+
+### Query Performance Optimization
+
+| Strategy | Before | After | Improvement |
+|----------|--------|-------|-------------|
+| Sequential queries | 65s (18 queries) | 10s (10 queries, 5 parallel) | 6.5x |
+| KPI from COUNT(*) scans | ~5s per metric | < 1s (PK lookup on 5 rows) | 5x |
+| Full table samples | LIMIT 2000 | LIMIT 500 (statistically sufficient) | 4x less I/O |
+| Redundant orders_enriched | 5 separate queries | 1 consolidated query | 5x fewer jobs |
+| Poll interval | 0.5s | 0.2s | Faster status detection |
+| Result pagination | Page 0 only (data loss) | All pages followed | Complete data |
+
+### Security Considerations (Production)
+
+- **Network isolation** — Fluss cluster in private subnet
+- **Authentication** — Flink SQL Gateway with token-based auth
+- **Encryption** — TLS for all inter-service communication
+- **Access control** — Role-based access to tables and queries
+- **Data masking** — PII fields masked in analytics tables
+- **Audit logging** — All query access logged for compliance
+
+### Deployment Topology (Production)
+
+```mermaid
+flowchart TB
+    subgraph az1 ["Availability Zone 1"]
+        JM1[Flink JobManager<br/>Active]
+        TM1[TaskManager x4]
+        TS1[Fluss TabletServer x2]
+    end
+    subgraph az2 ["Availability Zone 2"]
+        JM2[Flink JobManager<br/>Standby]
+        TM2[TaskManager x4]
+        TS2[Fluss TabletServer x2]
+    end
+    subgraph shared ["Shared Services"]
+        ZK[ZooKeeper Ensemble x3]
+        CS[Fluss CoordinatorServer x2]
+        S3[(Object Storage<br/>Checkpoints + Lakehouse)]
+    end
+
+    JM1 --> TM1
+    JM2 --> TM2
+    TM1 --> TS1
+    TM2 --> TS2
+    CS --> ZK
+    TS1 --> S3
+    TS2 --> S3
+```
+
 ## License
 
 This project is for educational and demonstration purposes.
